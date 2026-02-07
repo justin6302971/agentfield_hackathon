@@ -1,6 +1,8 @@
 from agentfield import AgentRouter
 from pydantic import BaseModel, Field
 from typing import List, Optional
+import wikipedia
+from youtubesearchpython import VideosSearch
 
 # Group related reasoners with a router
 reasoners_router = AgentRouter(prefix="music", tags=["classical-music", "education"])
@@ -22,6 +24,7 @@ class Recommendation(BaseModel):
     composer: str = Field(description="Composer of the piece")
     reason: str = Field(description="Why this was recommended")
     youtube_search_query: str = Field(description="Optimized search query for finding a recording")
+    video_url: Optional[str] = Field(description="YouTube video URL (populated by skill)")
 
 class RecommendationList(BaseModel):
     """List of recommendations."""
@@ -44,6 +47,13 @@ class ClassicalMusicLecture(BaseModel):
     key_points: List[str] = Field(description="Key historical or theoretical points")
     recommended_listening: List[str] = Field(description="List of specific pieces to listen to")
     fun_fact: str = Field(description="An interesting or obscure fact related to the topic")
+
+class WikiResult(BaseModel):
+    """Structured result from Wikipedia search."""
+    title: str = Field(description="Page title")
+    summary: str = Field(description="Page summary")
+    url: str = Field(description="Page URL")
+    error: Optional[str] = Field(description="Error message if search failed")
 
 # --- Local Data ---
 
@@ -110,6 +120,71 @@ COMPOSER_INDEX = {
     },
 }
 
+# --- Skills ---
+
+@reasoners_router.skill()
+def search_wikipedia(query: str) -> dict:
+    """
+    Searches Wikipedia for a topic and returns a structured result.
+    This is a deterministic skill that fetches external data.
+    """
+    try:
+        results = wikipedia.search(query)
+        if not results:
+            return {"error": f"No results found for {query}"}
+        
+        # Fetch the page (blocking call, but acceptable for this skill)
+        page = wikipedia.page(results[0], auto_suggest=False)
+        return {
+            "title": page.title,
+            "summary": page.summary,
+            "url": page.url
+        }
+    except wikipedia.exceptions.DisambiguationError as e:
+        return {"error": f"Ambiguous search. Options: {e.options[:5]}"}
+    except wikipedia.exceptions.PageError:
+        return {"error": "Page not found."}
+    except Exception as e:
+        return {"error": str(e)}
+
+@reasoners_router.skill()
+def search_video(query: str, limit: int = 1) -> dict:
+    """
+    Searches for a video on YouTube using the provided query.
+    Returns the video URL and title of the top result.
+    """
+    try:
+        videos_search = VideosSearch(query, limit=limit)
+        results = videos_search.result()
+        
+        if not results or not results.get("result"):
+            reasoners_router.app.note(
+                f"Video search failed for query: {query}",
+                tags=["video-search", "failed"]
+            )
+            return {"error": f"No videos found for: {query}"}
+            
+        top_result = results["result"][0]
+        
+        # Log successful search for observation
+        reasoners_router.app.note(
+            f"Video found: {top_result.get('title')} ({top_result.get('link')})",
+            tags=["video-search", "success"]
+        )
+        
+        return {
+            "title": top_result.get("title"),
+            "link": top_result.get("link"),
+            "duration": top_result.get("duration"),
+            "channel": top_result.get("channel", {}).get("name")
+        }
+    except Exception as e:
+        reasoners_router.app.note(
+            f"Video search error: {str(e)}",
+            tags=["video-search", "error"]
+        )
+        return {"error": str(e)}
+
 # --- Reasoners ---
 
 @reasoners_router.reasoner()
@@ -126,15 +201,13 @@ async def echo(message: str) -> dict:
 @reasoners_router.reasoner()
 async def get_composer_info(name: str) -> dict:
     """
-    Hybrid composer lookup. Checks local database first, then falls back to AI.
+    Hybrid composer lookup. Checks local database first, then Wikipedia, then falls back to AI.
     """
     key = name.strip().lower()
     
     # 1. Local Lookup
     if key in COMPOSER_INDEX:
         profile_data = COMPOSER_INDEX[key]
-        # Return in a format matching the AI schema for consistency
-        # Adding defaults for fields not in local index
         return ComposerProfile(
             name=profile_data["name"],
             era=profile_data["era"],
@@ -144,11 +217,24 @@ async def get_composer_info(name: str) -> dict:
             description="Profile retrieved from local database."
         ).model_dump()
     
-    # 2. AI Fallback
+    # 2. Wikipedia Lookup via Skill
+    # We call the skill function directly. The router/agent framework ensures 
+    # this call is tracked if configured.
+    wiki_data = search_wikipedia(name)
+    
+    wiki_context = ""
+    if "error" not in wiki_data:
+        wiki_context = f"Wikipedia Summary for {wiki_data.get('title')}: {wiki_data.get('summary')}"
+    
+    # 3. AI Generation
     system_prompt = "You are a classical music encyclopedia. Provide a structured profile for the requested composer."
+    user_prompt = f"Profile for composer: {name}"
+    if wiki_context:
+        user_prompt += f"\n\nContext from Wikipedia:\n{wiki_context}"
+
     result = await reasoners_router.app.ai(
         system=system_prompt,
-        user=f"Profile for composer: {name}",
+        user=user_prompt,
         schema=ComposerProfile
     )
     return result.model_dump()
@@ -156,7 +242,7 @@ async def get_composer_info(name: str) -> dict:
 @reasoners_router.reasoner()
 async def recommend_music(mood: str, similar_to: Optional[str] = None, difficulty: Optional[str] = None) -> dict:
     """
-    Suggests classical music based on mood or similarity.
+    Suggests classical music based on mood or similarity, and finds video links for them.
     """
     system_prompt = (
         "You are a music curator. Recommend 3-5 classical pieces based on the user's criteria. "
@@ -169,11 +255,26 @@ async def recommend_music(mood: str, similar_to: Optional[str] = None, difficult
     if difficulty:
         user_prompt += f" I am a {difficulty} listener."
 
+    # 1. Get Recommendations from AI
     result = await reasoners_router.app.ai(
         system=system_prompt,
         user=user_prompt,
         schema=RecommendationList
     )
+    
+    # 2. Enrich with Video Links
+    enriched_recommendations = []
+    for rec in result.recommendations:
+        # Call the search_video skill for each recommendation
+        # We use the generated search query
+        video_info = search_video(rec.youtube_search_query)
+        
+        if "link" in video_info:
+            rec.video_url = video_info["link"]
+        
+        enriched_recommendations.append(rec)
+    
+    result.recommendations = enriched_recommendations
     return result.model_dump()
 
 @reasoners_router.reasoner()
