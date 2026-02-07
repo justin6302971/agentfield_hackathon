@@ -17,6 +17,7 @@ class ComposerProfile(BaseModel):
     notable_works: List[str] = Field(description="List of famous compositions")
     life_dates: Optional[str] = Field(description="Birth and death years (e.g., 1685-1750)")
     description: Optional[str] = Field(description="Brief biography or style description")
+    image_url: Optional[str] = Field(description="URL to an image of the composer")
 
 class Recommendation(BaseModel):
     """A single music recommendation."""
@@ -45,6 +46,7 @@ class ClassicalMusicLecture(BaseModel):
     topic: str = Field(description="The main topic or composer being discussed")
     summary: str = Field(description="A concise summary of the lecture")
     key_points: List[str] = Field(description="Key historical or theoretical points")
+    related_composers: List[str] = Field(description="List of key composers associated with this topic")
     recommended_listening: List[str] = Field(description="List of specific pieces to listen to")
     fun_fact: str = Field(description="An interesting or obscure fact related to the topic")
 
@@ -185,19 +187,49 @@ def search_video(query: str, limit: int = 1) -> dict:
         )
         return {"error": str(e)}
 
+@reasoners_router.skill()
+def get_artist_image(artist_name: str) -> dict:
+    """
+    Fetches the main image URL for an artist or composer from Wikipedia.
+    """
+    try:
+        # Search for the page
+        results = wikipedia.search(artist_name)
+        if not results:
+            return {"error": f"No Wikipedia page found for {artist_name}"}
+        
+        # Get the page
+        page = wikipedia.page(results[0], auto_suggest=False)
+        
+        # Get images
+        images = page.images
+        if not images:
+             return {"error": "No images found on Wikipedia page."}
+        
+        # Simple heuristic: prefer .jpg or .png, filter out svg icons if possible
+        # Wikipedia images often include icons, maps, etc.
+        # We'll take the first one that looks like a photo
+        valid_extensions = (".jpg", ".jpeg", ".png")
+        best_image = None
+        
+        for img_url in images:
+            if img_url.lower().endswith(valid_extensions):
+                # Wikipedia often puts the main portrait first or second in the list logic, 
+                # but technically 'images' is a set or list with no guaranteed order in some versions.
+                # However, usually the main image is prominent. 
+                # Let's just take the first valid image for now.
+                best_image = img_url
+                break
+        
+        if not best_image and images:
+             best_image = images[0] # Fallback
+             
+        return {"image_url": best_image, "source": page.url}
+
+    except Exception as e:
+        return {"error": str(e)}
+
 # --- Reasoners ---
-
-@reasoners_router.reasoner()
-async def echo(message: str) -> dict:
-    """
-    Simple echo reasoner - works without AI configured.
-    """
-    return {
-        "original": message,
-        "echoed": message,
-        "length": len(message)
-    }
-
 @reasoners_router.reasoner()
 async def get_composer_info(name: str) -> dict:
     """
@@ -222,6 +254,10 @@ async def get_composer_info(name: str) -> dict:
     # this call is tracked if configured.
     wiki_data = search_wikipedia(name)
     
+    # Also fetch image
+    image_data = get_artist_image(name)
+    image_url = image_data.get("image_url")
+    
     wiki_context = ""
     if "error" not in wiki_data:
         wiki_context = f"Wikipedia Summary for {wiki_data.get('title')}: {wiki_data.get('summary')}"
@@ -237,10 +273,15 @@ async def get_composer_info(name: str) -> dict:
         user=user_prompt,
         schema=ComposerProfile
     )
+    
+    # Inject the image URL if found
+    if image_url:
+        result.image_url = image_url
+        
     return result.model_dump()
 
 @reasoners_router.reasoner()
-async def recommend_music(mood: str, similar_to: Optional[str] = None, difficulty: Optional[str] = None) -> dict:
+async def recommend_music(mood: Optional[str] = None, similar_to: Optional[str] = None, difficulty: Optional[str] = None) -> dict:
     """
     Suggests classical music based on mood or similarity, and finds video links for them.
     """
@@ -249,11 +290,16 @@ async def recommend_music(mood: str, similar_to: Optional[str] = None, difficult
         "Include a mix of well-known and hidden gems."
     )
     
-    user_prompt = f"I feel {mood}."
+    user_prompt = ""
+    if mood:
+        user_prompt += f"I feel {mood}. "
     if similar_to:
-        user_prompt += f" I like {similar_to}."
+        user_prompt += f"I like {similar_to}. "
     if difficulty:
-        user_prompt += f" I am a {difficulty} listener."
+        user_prompt += f"I am a {difficulty} listener. "
+    
+    if not user_prompt:
+        user_prompt = "Recommend me some great classical music."
 
     # 1. Get Recommendations from AI
     result = await reasoners_router.app.ai(
@@ -312,6 +358,7 @@ async def lecture(topic: str) -> dict:
         "You are a world-renowned professor of musicology and a classical music expert. "
         "Your goal is to educate users about classical music history, theory, and appreciation. "
         "Provide accurate, insightful, and engaging lectures. "
+        "Identify key composers associated with the topic. "
         "When recommending listening, be specific about the work and, if applicable, the movement."
     )
 
